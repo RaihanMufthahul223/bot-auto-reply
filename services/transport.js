@@ -11,6 +11,9 @@ class Transport {
     this.botJid = botJid;
     this.sentKeys = new Map();
   }
+  setSocket(sock) {
+    this.sock = sock;
+  }
   ownerNumbers() {
     return [...(process.env.OWNER_NUMBERS || '').split(','), process.env.ADMIN_NUMBER || '']
       .map(s => s.trim()).filter(Boolean);
