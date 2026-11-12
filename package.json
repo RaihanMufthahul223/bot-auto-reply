@@ -1,0 +1,25 @@
+{
+  "name": "bot-auto-reply",
+  "version": "1.0.0",
+  "description": "WhatsApp auto-reply bot (Baileys) for small business",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "baileys"
+  ],
+  "type": "commonjs",
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "dotenv": "18.0.10",
+    "pino": "10.4.0",
+    "qrcode-terminal": "0.12.0"
+  },
+  "devDependencies": {
+    "pm2": "7.1.2"
+  }
+}
