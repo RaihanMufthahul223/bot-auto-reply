@@ -8,6 +8,7 @@ const pino = require('pino');
 let baileys = null;
 let sock = null;
 let onMessage = null;
+let onSocketChange = null;
 let reconnectAttempts = 0;
 let stopping = false;
 let currentQr = null;
@@ -128,9 +129,9 @@ function attachSocketEvents(socket, generation, b) {
     const reason = b.DisconnectReason || {};
     const errorMessage = lastDisconnect?.error?.message || 'Tidak ada detail error';
 
-    // Lepaskan referensi socket terlebih dahulu agar reconnect hanya membuat satu socket baru.
     sock = null;
     currentQr = null;
+    if (typeof onSocketChange === 'function') onSocketChange(null);
 
     if (code === reason.loggedOut || code === 401) {
       stopping = true;
@@ -189,7 +190,6 @@ async function start() {
 
     const newSocket = await createSocket();
 
-    // Jika proses dihentikan ketika auth/socket sedang disiapkan, jangan biarkan socket yatim.
     if (stopping || generation !== socketGeneration) {
       try {
         await newSocket.end(undefined);
@@ -201,6 +201,7 @@ async function start() {
 
     sock = newSocket;
     currentQr = null;
+    if (typeof onSocketChange === 'function') onSocketChange(newSocket);
     attachSocketEvents(newSocket, generation, b);
     return newSocket;
   })();
@@ -220,6 +221,7 @@ async function stop() {
 
   const activeSocket = sock;
   sock = null;
+  if (typeof onSocketChange === 'function') onSocketChange(null);
 
   if (activeSocket) {
     try {
@@ -278,6 +280,10 @@ module.exports = {
   releaseLock,
   setMessageHandler(fn) {
     onMessage = fn;
+  },
+  setSocketHandler(fn) {
+    onSocketChange = typeof fn === 'function' ? fn : null;
+    if (onSocketChange) onSocketChange(sock);
   },
   setLogger(fn) {
     logError = typeof fn === 'function' ? fn : () => {};
