@@ -4,7 +4,6 @@ const fs = require('fs');
 const path = require('path');
 const qrcodeTerminal = require('qrcode-terminal');
 const pino = require('pino');
-const config = require('../config/botConfig');
 
 let baileys = null;
 let sock = null;
@@ -12,11 +11,14 @@ let onMessage = null;
 let reconnectAttempts = 0;
 let stopping = false;
 let currentQr = null;
+let reconnectTimer = null;
+let startPromise = null;
+let socketGeneration = 0;
 let logError = () => {};
 
 async function loadBaileys() {
   if (!baileys) {
-    // Baileys v7 (terpasang: 7.0.0-rc14) berjenis ESM -> wajib load via dynamic import().
+    // Baileys v7 adalah ESM, sehingga dimuat melalui dynamic import().
     baileys = await import('@whiskeysockets/baileys');
   }
   return baileys;
@@ -26,11 +28,12 @@ function getAuthFolder() {
   return process.env.AUTH_FOLDER || 'auth_info_baileys';
 }
 
-async function createSocket(opts) {
+async function createSocket(opts = {}) {
   const b = await loadBaileys();
   const authResult = await b.useMultiFileAuthState(opts.authFolder || getAuthFolder());
   const authState = authResult && authResult.state ? authResult.state : authResult;
-  const s = b.makeWASocket({
+
+  return b.makeWASocket({
     auth: {
       creds: authState.creds,
       keys: authState.keys,
@@ -41,108 +44,188 @@ async function createSocket(opts) {
     shouldSyncHistoryMessage: () => false,
     emitOwnEvents: true,
   });
-  sock = s;
-  return s;
 }
 
 function printQr(qr) {
+  if (typeof qr !== 'string' || !qr) return;
+
   try {
-    const out = qrcodeTerminal.generate(qr, { small: true });
-    console.log(out);
-  } catch (e) {
-    // abaikan kegagalan print QR
+    // qrcode-terminal menulis langsung ke stdout jika callback tidak diberikan.
+    // Jangan console.log hasil generate(): nilainya undefined.
+    qrcodeTerminal.generate(qr, { small: true });
+  } catch (error) {
+    logError(`Gagal menampilkan QR: ${error?.message || error}`);
   }
 }
 
 function getDisconnectCode(lastDisconnect) {
-  const err = lastDisconnect && lastDisconnect.error;
-  const statusCode = err ? err.output?.statusCode ?? err.data?.status ?? err.data?.code : undefined;
-  const reason = baileys && baileys.DisconnectReason;
-  if (statusCode === undefined && reason) {
-    if (reason.loggedOut !== undefined) return reason.loggedOut;
-    if (reason.connectionReplaced !== undefined) return reason.connectionReplaced;
-    if (reason.restartRequired !== undefined) return reason.restartRequired;
-  }
-  return statusCode;
+  const error = lastDisconnect?.error;
+  // Jangan menebak DisconnectReason jika server tidak mengirim status code.
+  return error?.output?.statusCode
+    ?? error?.data?.status
+    ?? error?.data?.code
+    ?? error?.statusCode;
 }
 
-function scheduleReconnect() {
-  if (stopping) return;
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function scheduleReconnect(delayOverride) {
+  if (stopping || reconnectTimer) return;
+
   if (reconnectAttempts >= 10) {
-    logError('Kegagalan reconnect berulang (maks 10). Berhenti dan butuh intervensi manual.');
+    logError('Reconnect dihentikan setelah 10 percobaan. Periksa koneksi dan jalankan ulang bot secara manual.');
     stopping = true;
     return;
   }
-  const baseDelay = 2000;
-  const delay = Math.min(60000, baseDelay * Math.pow(2, reconnectAttempts)) * (1 + Math.random() * 0.3);
+
+  const exponentialDelay = Math.min(60000, 2000 * (2 ** reconnectAttempts));
+  const delay = delayOverride ?? Math.round(exponentialDelay * (1 + Math.random() * 0.3));
   reconnectAttempts += 1;
-  setTimeout(async () => {
+
+  logError(`Koneksi terputus. Mencoba menghubungkan kembali dalam ${delay} ms (percobaan ${reconnectAttempts}/10).`);
+
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
     if (stopping) return;
+
     try {
       await start();
-    } catch (e) {
-      logError(`Reconnect gagal: ${e && e.message ? e.message : e}`);
+    } catch (error) {
+      logError(`Reconnect gagal: ${error?.message || error}`);
       scheduleReconnect();
     }
   }, delay);
 }
 
-async function start() {
-  if (stopping) return;
-  const socket = await createSocket({});
-  const b = await loadBaileys();
+function attachSocketEvents(socket, generation, b) {
+  socket.ev.on('connection.update', ({ connection, lastDisconnect, qr } = {}) => {
+    // Abaikan event dari socket lama yang sudah digantikan.
+    if (generation !== socketGeneration || socket !== sock || stopping) return;
 
-  socket.ev.on('connection.update', async ({ connection, lastDisconnect, qr } = {}) => {
-    if (qr) {
+    if (qr && qr !== currentQr) {
       currentQr = qr;
+      console.log('\nQR WhatsApp terbaru:');
       printQr(qr);
+      console.log('Scan QR ini melalui WhatsApp > Perangkat tertaut.\n');
     }
-    if (connection !== 'close') return;
-    const code = getDisconnectCode(lastDisconnect);
-    const reason = baileys && baileys.DisconnectReason;
-    const is = (v) => v !== undefined && code === v;
-    if (is(reason?.loggedOut) || code === 401) {
-      // loggedOut: BERHENTI. Jangan reconnect otomatis. Sesi harus dihapus manual + scan ulang.
-      stopping = true;
-      return;
-    }
-    if (is(reason?.connectionReplaced) || code === 440) {
-      // Sesi lain dipakai akun ini. BERHENTI, jangan merebut balik.
-      stopping = true;
-      return;
-    }
-    if (is(reason?.restartRequired) || code === 515) {
+
+    if (connection === 'open') {
+      currentQr = null;
       reconnectAttempts = 0;
-      await start();
+      clearReconnectTimer();
+      console.log('WhatsApp berhasil terhubung.');
       return;
     }
+
+    if (connection !== 'close') return;
+
+    const code = getDisconnectCode(lastDisconnect);
+    const reason = b.DisconnectReason || {};
+    const errorMessage = lastDisconnect?.error?.message || 'Tidak ada detail error';
+
+    // Lepaskan referensi socket terlebih dahulu agar reconnect hanya membuat satu socket baru.
+    sock = null;
+    currentQr = null;
+
+    if (code === reason.loggedOut || code === 401) {
+      stopping = true;
+      clearReconnectTimer();
+      logError('Sesi WhatsApp logout (401). Reconnect otomatis dihentikan. Hubungkan ulang secara manual.');
+      return;
+    }
+
+    if (code === reason.connectionReplaced || code === 440) {
+      stopping = true;
+      clearReconnectTimer();
+      logError('Koneksi WhatsApp digantikan oleh sesi lain (440). Bot dihentikan agar tidak terjadi perebutan sesi.');
+      return;
+    }
+
+    if (code === reason.restartRequired || code === 515) {
+      reconnectAttempts = 0;
+      logError('WhatsApp meminta restart koneksi (515). Menyiapkan satu socket pengganti.');
+      scheduleReconnect(500);
+      return;
+    }
+
+    logError(`Koneksi WhatsApp ditutup (kode: ${code ?? 'tidak diketahui'}): ${errorMessage}`);
     scheduleReconnect();
   });
 
   socket.ev.on('messages.upsert', async ({ messages } = {}) => {
+    if (generation !== socketGeneration || socket !== sock || stopping) return;
+
     const list = Array.isArray(messages) ? messages : messages?.messages;
     if (!Array.isArray(list)) return;
+
     for (const message of list) {
-      if (typeof onMessage === 'function') {
-        try {
-          await onMessage(message);
-        } catch (e) {
-          logError(`Error handler pesan: ${e && e.message ? e.message : e}`);
-        }
+      if (generation !== socketGeneration || socket !== sock || stopping) break;
+      if (typeof onMessage !== 'function') continue;
+
+      try {
+        await onMessage(message);
+      } catch (error) {
+        logError(`Error handler pesan: ${error?.message || error}`);
       }
     }
   });
+}
 
-  return socket;
+async function start() {
+  if (stopping) return null;
+  if (sock) return sock;
+  if (startPromise) return startPromise;
+
+  startPromise = (async () => {
+    const generation = ++socketGeneration;
+    const b = await loadBaileys();
+
+    if (stopping) return null;
+
+    const newSocket = await createSocket();
+
+    // Jika proses dihentikan ketika auth/socket sedang disiapkan, jangan biarkan socket yatim.
+    if (stopping || generation !== socketGeneration) {
+      try {
+        await newSocket.end(undefined);
+      } catch (_) {
+        // Socket sudah tidak aktif.
+      }
+      return null;
+    }
+
+    sock = newSocket;
+    currentQr = null;
+    attachSocketEvents(newSocket, generation, b);
+    return newSocket;
+  })();
+
+  try {
+    return await startPromise;
+  } finally {
+    startPromise = null;
+  }
 }
 
 async function stop() {
   stopping = true;
-  if (sock) {
+  socketGeneration += 1;
+  clearReconnectTimer();
+  currentQr = null;
+
+  const activeSocket = sock;
+  sock = null;
+
+  if (activeSocket) {
     try {
-      await sock.end(undefined);
-    } catch (e) {
-      // abaikan
+      await activeSocket.end(undefined);
+    } catch (_) {
+      // Abaikan jika socket sudah tertutup.
     }
   }
 }
@@ -150,34 +233,39 @@ async function stop() {
 function acquireLock() {
   const lockPath = path.resolve(process.cwd(), 'data', 'bot.lock');
   const dataDir = path.dirname(lockPath);
+
   try {
     fs.mkdirSync(dataDir, { recursive: true });
-  } catch (e) {
-    // abaikan
+  } catch (_) {
+    // Penulisan lock di bawah akan melaporkan error jika direktori tidak tersedia.
   }
+
   const existingRaw = fs.existsSync(lockPath) ? fs.readFileSync(lockPath, 'utf8').trim() : '';
   const existingPid = existingRaw ? parseInt(existingRaw, 10) : null;
+
   const alive = (pid) => {
     if (!pid) return false;
     try {
       process.kill(pid, 0);
       return true;
-    } catch (e) {
+    } catch (_) {
       return false;
     }
   };
+
   if (existingPid && alive(existingPid) && existingPid !== process.pid) {
     logError(`Lock gagal: instance lain (PID ${existingPid}) masih berjalan.`);
     process.exit(1);
   }
+
   fs.writeFileSync(lockPath, String(process.pid));
 }
 
 function releaseLock() {
   try {
     fs.unlinkSync(path.resolve(process.cwd(), 'data', 'bot.lock'));
-  } catch (e) {
-    // abaikan
+  } catch (_) {
+    // Abaikan jika lock sudah tidak ada.
   }
 }
 
@@ -190,6 +278,9 @@ module.exports = {
   releaseLock,
   setMessageHandler(fn) {
     onMessage = fn;
+  },
+  setLogger(fn) {
+    logError = typeof fn === 'function' ? fn : () => {};
   },
   getSocket: () => sock,
 };
