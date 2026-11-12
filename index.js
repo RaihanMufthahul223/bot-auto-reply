@@ -32,6 +32,8 @@ const log = pino({
   })(),
 });
 
+connection.setLogger((message) => log.error(message));
+
 function toDigits(s) {
   return String(s || '').replace(/[^0-9]/g, '');
 }
@@ -42,8 +44,6 @@ function isOwnerNumber(jid) {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-  // Hanya OWNER_NUMBERS yang boleh menjalankan perintah owner.
-  // ADMIN_NUMBER khusus untuk menerima notifikasi & ditangani sebagai mode human.
   return ownerList.some((o) => toDigits(o) === digits);
 }
 
@@ -55,10 +55,13 @@ async function main() {
   const socket = await connection.start();
 
   const startedAt = Date.now();
-  const botJid = socket.user?.id ? cleanJid(socket.user.id) : undefined;
+  const botJid = socket?.user?.id ? cleanJid(socket.user.id) : undefined;
 
   const humanizer = require('./services/humanizer');
   const transport = new Transport({ sock: socket, stateStore, rateLimiter, humanizer, botJid });
+
+  // Transport harus selalu memakai socket terbaru setelah proses reconnect.
+  connection.setSocketHandler((activeSocket) => transport.setSocket(activeSocket));
 
   // Kill switch: 5x gagal berturut-turut -> botEnabled=false
   let failureCount = 0;
@@ -121,9 +124,8 @@ async function main() {
 }
 
 function shutdown() {
-  const connectionRef = require('./services/connection');
-  connectionRef.stop().finally(() => {
-    connectionRef.releaseLock();
+  connection.stop().finally(() => {
+    connection.releaseLock();
     process.exit(0);
   });
 }
@@ -132,7 +134,6 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 main().catch((e) => {
-  // jangan pakai process.exit kecuali kondisi kritis
   console.error('Fatal error bot:', e);
   process.exit(1);
 });
