@@ -3,49 +3,30 @@
 const config = require('../config/botConfig');
 const { sleep, randInt, clamp } = require('../utils/math');
 
-/**
- * F6. Delay dan indikator mengetik.
- * Menghitung jeda baca acak, durasi mengetik (tergantung panjang teks), jitter acak,
- * dan mengirim pesan dengan gaya manusiawi (read -> composing -> typing -> paused -> send).
- */
 function computeTypingMs(text, humanizeConfig) {
   const cfg = { ...(config.humanize || {}), ...(humanizeConfig || {}) };
-  const typingMs = (Number(cfg.typingPerCharMs) || 35) * String(text || '').length + randInt(300, 1200);
-  return clamp(typingMs, Number(cfg.typingMinMs) || 1500, Number(cfg.typingMaxMs) || 6000);
+  const typingMs = (Number(cfg.typingPerCharMs) || 25) * String(text || '').length + randInt(250, 900);
+  return clamp(typingMs, Number(cfg.typingMinMs) || 900, Number(cfg.typingMaxMs) || 3500);
 }
 
 async function sendHumanized(sock, jid, text, msgKey) {
   const cfg = config.humanize || {};
-  await sleep(randInt(cfg.readDelayMs?.[0] ?? 800, cfg.readDelayMs?.[1] ?? 2500));
+  await sleep(randInt(cfg.readDelayMs?.[0] ?? 700, cfg.readDelayMs?.[1] ?? 1800));
 
   if (msgKey) {
-    try {
-      await sock.readMessages([msgKey]);
-    } catch (e) {
-      // abaikan kegagalan mark-read, kirim tetap dilanjutkan
-    }
+    try { await sock.readMessages([msgKey]); } catch (_) {}
   }
+  try { await sock.presenceSubscribe(jid); } catch (_) {}
+  try { await sock.sendPresenceUpdate('composing', jid); } catch (_) {}
 
-  try {
-    await sock.presenceSubscribe(jid);
-  } catch (e) {
-    // presence subscribe wajib untuk indikator mengetik
-  }
-  await sock.sendPresenceUpdate('composing', jid);
-  const typingMs = computeTypingMs(text, cfg);
-  await sleep(typingMs);
-  await sock.sendPresenceUpdate('paused', jid);
+  await sleep(computeTypingMs(text, cfg));
+  try { await sock.sendPresenceUpdate('paused', jid); } catch (_) {}
 
-  const sent = await sock.sendMessage(jid, { text });
+  const sent = await sock.sendMessage(jid, { text: String(text || '') });
   const key = sent?.key;
   if (key) {
-    try {
-      await sock.readMessages([key]);
-    } catch (e) {
-      // abaikan
-    }
+    try { await sock.readMessages([key]); } catch (_) {}
   }
   return key;
 }
-
 module.exports = { sleep, randInt, clamp, computeTypingMs, sendHumanized };
